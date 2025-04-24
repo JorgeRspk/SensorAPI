@@ -37,6 +37,8 @@ const pool = new Pool({
 });
 
 
+
+
 // -------------------------    Endpoints PostgreSQL  -----------------------------------
 
 // Endpoint para obtener los últimos 50 valores de los sensores
@@ -126,6 +128,63 @@ app.get('/api/organizations/:orgId/devices', async (req, res) => {
     } catch (error) {
         console.error('Error al obtener dispositivos de la organización:', error);
         res.status(500).json({ error: 'Error al obtener dispositivos de la organización' });
+    }
+});
+
+// Endpoint para obtener los sensores por ID de organización
+app.get('/api/organizations/:orgId/sensors', async (req, res) => {
+    const { orgId } = req.params;
+    
+    try {
+        const result = await pool.query(`
+            SELECT 
+                s.id,
+                s.nombre,
+                s.fecha_creacion,
+                s.habilitada,
+                s.nodo,
+                s.id_tipo_sensor,
+                s.id_modelo,
+                s.last_connection,
+                ts.id as tipo_sensor_id,
+                ts.nombre as tipo_sensor_nombre,
+                ts.descripcion as tipo_sensor_descripcion,
+                ms.id as modelo_sensor_id,
+                ms.nombre as modelo_sensor_nombre,
+                ms.descripcion as modelo_sensor_descripcion
+            FROM Sensor s
+            JOIN tipo_sensor ts ON s.id_tipo_sensor = ts.id
+            JOIN modelo_sensor ms ON s.id_modelo = ms.id
+            WHERE s.id_org = $1
+            ORDER BY s.nombre
+        `, [orgId]);
+
+        // Transformar los resultados para que coincidan con la interfaz esperada
+        const sensors = result.rows.map(row => ({
+            id: row.id,
+            nombre: row.nombre,
+            fecha_creacion: row.fecha_creacion,
+            habilitada: row.habilitada,
+            nodo: row.nodo,
+            id_tipo_sensor: row.id_tipo_sensor,
+            id_modelo: row.id_modelo,
+            last_connection: row.last_connection,
+            tipo_sensor: {
+                id: row.tipo_sensor_id,
+                nombre: row.tipo_sensor_nombre,
+                descripcion: row.tipo_sensor_descripcion
+            },
+            modelo_sensor: {
+                id: row.modelo_sensor_id,
+                nombre: row.modelo_sensor_nombre,
+                descripcion: row.modelo_sensor_descripcion
+            }
+        }));
+
+        res.json(sensors);
+    } catch (error) {
+        console.error('Error al obtener sensores de la organización:', error);
+        res.status(500).json({ error: 'Error al obtener sensores de la organización' });
     }
 });
 
@@ -219,65 +278,74 @@ app.get('/api/organizations/:orgId', async (req, res) => {
     }
 });
 
+// Endpoit de los 
 
-// -------------------------    Endpoints influxdb  -----------------------------------
-
-// Endpoit para rescatar los measurments de la base de datos de influxdb
-app.get('/influxdb-measurements', async (req, res) => {
-    const client = new InfluxDBClient({host: url, token: token})
-
-    // obtener schema de la base de datos
-    const query = `SELECT DISTINCT(table_name) FROM information_schema.columns`
-    
-    const result = await client.query(query, bucket)
-
-    // Array para almacenar todos los datos transformados
-    const transformedData = [];
-
-    // Transformar los datos del AsyncGenerator a un array
-    for await (const row of result) {
-        transformedData.push({
-            measurements: String(row.table_name)
-        });
+// Endpoit para rescatar los measurments de la base de datos de postgres de una organizacion especifica
+app.get('/api/organizations/:orgId/measurements', async (req, res) => {
+    const { orgId } = req.params;
+    try {
+        const result = await pool.query(`
+            SELECT DISTINCT c.nombre
+            FROM columnas c
+            JOIN sensor sn ON c.dispositivoid = sn.id 
+            WHERE sn.id_org = $1
+            ORDER BY nombre
+        `, [orgId]);
+        const measurements = result.rows.map(row => row.nombre);
+        res.json(measurements);
+    } catch (error) {
+        console.error('Error al obtener los measurements:', error);
+        res.status(500).json({ error: 'Error al obtener los measurements' });
     }
-    console.log(transformedData);
+});
 
-    // Enviar los datos transformados
-    res.json(transformedData);
-})
+// Endpoint para insertar datos en una tabla de PostgreSQL de un dispositivo específico, lel nombre de tabla debe ser igual al nombre del dispositivo
+app.post('/api/devices/:deviceId/data', async (req, res) => {
+    const { deviceId } = req.params;
+    // data en json
+    const  data = req.body; // Suponiendo que los datos vienen en el cuerpo de la solicitud
 
-//Endpoint para obtener los datos de influxdb, ultimos 50 valores de humedad y temperatura
-app.get('/influxdb-data', async (req, res) => {
-    const client = new InfluxDBClient({host: url, token: token})
-    const { point } = req.query;
+    const fecha_actual = new Date().toISOString(); // Obtener la fecha y hora actual en formato ISO 8601
 
-    const query = `SELECT * FROM "${point}" WHERE time >= now() - interval '24 hours'` 
-    
-    const result = await client.query(query, bucket)
-    
-    // Array para almacenar todos los datos transformados
-    const transformedData = [];
-    
-    // Transformar los datos del AsyncGenerator a un array
-    for await (const row of result) {
-        transformedData.push({
-            Moisture_Percent: Number(row.Moisture_Percent) || 0,
-            Temperature: Number(row.Temperature) || 0,
-            time: new Date(row.time).toISOString()
-        });
+    try {
+        console.log('Datos recibidos:', req.body); // Log para verificar los datos recibidos
+        // Insertar los datos en la tabla correspondiente al dispositivo con la fecha actual
+        const query = `INSERT INTO "${deviceId}" (humedad, temperatura, timestamp) VALUES ($1, $2, $3)`;
+        await pool.query(query, [data.moisture_percent, data.temperature, fecha_actual]);
+
+        res.status(201).json({ message: 'Datos insertados correctamente' });
+    } catch (error) {
+        console.error('Error al insertar datos en PostgreSQL:', error);
+        res.status(500).json({ error: 'Error al insertar datos en PostgreSQL' });
     }
-    
-    // Ordenar los datos por tiempo de más reciente a más antiguo
-    transformedData.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
-    
-    // Limitar a los últimos 50 registros
-    const lastFiftyRecords = transformedData.slice(0, 50);
-    
-    // Enviar los datos transformados
-    res.json(lastFiftyRecords);
-})
+});
+
+// Endpoint para obtener datos de un sensor específico desde postgreSQL, especificar numero de registros a obtener
+app.get('/api/sensors/:sensorId/data', async (req, res) => {
+    const { sensorId } = req.params;
+    const { limit = 50 } = req.query; // Limitar a 50 registros por defecto
+    console.log('Sensor ID:', sensorId); // Log para verificar el ID del sensor
+
+    try {
+        const result = await pool.query(
+            `SELECT humedad, temperatura, timestamp FROM "${sensorId}" ORDER BY timestamp DESC LIMIT $1`,
+            [limit]
+        );
+        //mostrar los datos en consola
+        console.log('Datos obtenidos:', result.rows); // Log para verificar los datos obtenidos
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error al obtener datos del sensor:', error);
+        res.status(500).json({ error: 'Error al obtener datos del sensor' });
+    }
+});
 
 
+// Endpoint de prueba para verificar que la API está funcionando
+app.get('/api/test', (req, res) => {
+    console.log('API funcionando correctamente');
+    res.json({ message: 'API funcionando correctamente' });
+});
 
 
 // Ruta de prueba
