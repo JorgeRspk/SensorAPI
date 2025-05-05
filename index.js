@@ -3,6 +3,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 require('dotenv').config();
 const {InfluxDBClient, Point} = require('@influxdata/influxdb3-client');
+const { insertAlertData, insertNotificationData, sendEmailNotification  } = require('./functions.js'); // Importar la función para insertar datos de alerta
 
 const app = express();
 const port = 3002;
@@ -11,6 +12,9 @@ const token = process.env.INFLUXDB_TOKEN
 const url = process.env.INFLUXDB_URL
 const org = process.env.INFLUXDB_ORG
 const bucket = process.env.INFLUXDB_BUCKET
+
+const user_id = process.env.USER_ID; // ID del usuario para las notificaciones
+const email = process.env.USER_EMAIL; // Email del usuario para las notificaciones
 
 async function main() {
     const client = new InfluxDBClient({host: url, token: token})
@@ -35,8 +39,6 @@ const pool = new Pool({
         rejectUnauthorized: false,
     }
 });
-
-
 
 
 // -------------------------    Endpoints PostgreSQL  -----------------------------------
@@ -292,14 +294,19 @@ app.get('/api/organizations/:orgId/measurements', async (req, res) => {
             ORDER BY nombre
         `, [orgId]);
         const measurements = result.rows.map(row => row.nombre);
-        res.json(measurements);
+        // Agregar numero de orden de measurements
+        const measurementsWithOrder = measurements.map((measurement, index) => ({
+            id: index + 1,
+            nombre: measurement
+        }));
+        res.json(measurementsWithOrder);
     } catch (error) {
         console.error('Error al obtener los measurements:', error);
         res.status(500).json({ error: 'Error al obtener los measurements' });
     }
 });
 
-// Endpoint para insertar datos en una tabla de PostgreSQL de un dispositivo específico, lel nombre de tabla debe ser igual al nombre del dispositivo
+// Endpoint para insertar datos en una tabla de PostgreSQL de un dispositivo específico, el nombre de tabla debe ser igual al nombre del dispositivo
 app.post('/api/devices/:deviceId/data', async (req, res) => {
     const { deviceId } = req.params;
     // data en json
@@ -312,6 +319,43 @@ app.post('/api/devices/:deviceId/data', async (req, res) => {
         // Insertar los datos en la tabla correspondiente al dispositivo con la fecha actual
         const query = `INSERT INTO "${deviceId}" (humedad, temperatura, timestamp) VALUES ($1, $2, $3)`;
         await pool.query(query, [data.moisture_percent, data.temperature, fecha_actual]);
+        if (data.moisture_percent < 30) {
+            mensaje = 'Humedad baja detectada en el dispositivo ' + deviceId + ': ' + data.moisture_percent + '%' + ' a las ' + fecha_actual + ' horas.' ;
+            const notificacion_id = await insertNotificationData(user_id, 7, mensaje, 'Alerta de humedad', JSON.stringify(data), email);
+            await insertAlertData(notificacion_id, 'moisture_percent', data.moisture_percent, deviceId, 'min');  
+            console.log('Alerta sensor', deviceId ,': Humedad baja detectada:', data.moisture_percent);
+            // Aquí puedes agregar la lógica para enviar una alerta o notificación
+            try {
+                await sendEmailNotification(user_id, 7, mensaje, 'Alerta de humedad', JSON.stringify(data), email);
+            } catch (error) {
+                console.error('Error al enviar la notificación por correo electrónico:', error);
+            }
+        }
+
+        if (data.temperature > 30) {
+            mensaje = 'Temperatura alta detectada en el dispositivo ' + deviceId + ': ' + data.temperature + '°C' + ' a las ' + fecha_actual + ' horas.' ;
+            const notificacion_id = await insertNotificationData(user_id, 7, mensaje, 'Alerta de temperatura', JSON.stringify(data), email);
+            await insertAlertData(notificacion_id, 'temperature', data.temperature, deviceId, 'max');
+            console.log('Alerta sensor', deviceId ,': Temperatura alta detectada:', data.temperature);
+            // Aquí puedes agregar la lógica para enviar una alerta o notificación
+            try {
+                await sendEmailNotification(user_id, 7, mensaje, 'Alerta de temperatura', JSON.stringify(data), email);
+            } catch (error) {
+                console.error('Error al enviar la notificación por correo electrónico:', error);
+            }
+        }
+        else if (data.temperature < 10) {
+            mensaje = 'Temperatura baja detectada en el dispositivo ' + deviceId + ': ' + data.temperature + '°C' + ' a las ' + fecha_actual + ' horas.' ;
+            const notificacion_id = await insertNotificationData(user_id, 7, mensaje, 'Alerta de temperatura', JSON.stringify(data), email);
+            await insertAlertData(notificacion_id, 'temperature', data.temperature, deviceId, 'min');
+            console.log('Alerta sensor', deviceId ,': Temperatura baja detectada:', data.temperature);
+            // Aquí puedes agregar la lógica para enviar una alerta o notificación
+            try {
+                await sendEmailNotification(user_id, 7, mensaje, 'Alerta de temperatura', JSON.stringify(data), email);
+            } catch (error) {
+                console.error('Error al enviar la notificación por correo electrónico:', error);
+            }
+        }
 
         res.status(201).json({ message: 'Datos insertados correctamente' });
     } catch (error) {
@@ -340,6 +384,72 @@ app.get('/api/sensors/:sensorId/data', async (req, res) => {
     }
 });
 
+// Endpointpara obtener las alertas de un sensor específico desde postgreSQL, especificar numero de registros a obtener
+app.get('/api/sensors/:sensorId/alerts', async (req, res) => {
+    const { sensorId } = req.params;
+    const { limit = 50 } = req.query; // Limitar a 50 registros por defecto
+    console.log('Sensor ID:', sensorId); // Log para verificar el ID del sensor
+
+    try {
+        const result = await pool.query(
+            `SELECT * FROM alerta WHERE sensor_id = $1 ORDER BY hora_creacion DESC LIMIT $2`,
+            [sensorId, limit]
+        );
+
+        // obtener el id de la notificacion
+        const notificacion_id = result.rows[0].id_notificacion;
+        
+        // obtener la data de la notificacion
+        const notificacion_result = await pool.query(
+            `SELECT * FROM notificacion WHERE id_notificacion = $1`,
+            [notificacion_id]
+        );
+
+        // agregar la data de la notificacion a la alerta
+        const alertas = result.rows.map(row => ({
+            id_alerta: row.id_alerta,
+            id_notificacion: row.id_notificacion,
+            metric_name: row.metric_name,
+            value: row.value,
+            sensor_id: row.sensor_id,
+            max_or_min: row.max_or_min,
+            hora_creacion: row.hora_creacion,
+            notificacion: notificacion_result.rows[0]
+            // lo anterior es para agregar la data de la notificacion a la alerta en forma de json
+        }));
+
+        //mostrar los datos en consola
+        console.log('Datos obtenidos:', alertas); // Log para verificar los datos obtenidos
+
+        // devolver la data de la alerta con la notificacion
+        res.json(alertas);
+
+
+    } catch (error) {
+        console.error('Error al obtener datos del sensor:', error);
+        res.status(500).json({ error: 'Error al obtener datos del sensor' });
+    }
+});
+
+// Endpoint para obtener las notificaciones de un usuario específico desde postgreSQL, especificar numero de registros a obtener
+app.get('/api/users/:userId/notifications', async (req, res) => {
+    const { userId } = req.params;
+    const { limit = 50 } = req.query; // Limitar a 50 registros por defecto
+    console.log('User ID:', userId); // Log para verificar el ID del usuario
+
+    try {
+        const result = await pool.query(
+            `SELECT * FROM notificacion WHERE user_id = $1 ORDER BY timestamp DESC LIMIT $2`,
+            [userId, limit]
+        );
+        //mostrar los datos en consola
+        console.log('Datos obtenidos:', result.rows); // Log para verificar los datos obtenidos
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error al obtener datos del sensor:', error);
+        res.status(500).json({ error: 'Error al obtener datos del sensor' });
+    }
+});
 
 // Endpoint de prueba para verificar que la API está funcionando
 app.get('/api/test', (req, res) => {
